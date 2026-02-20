@@ -7,7 +7,7 @@ use OpenApi\Attributes as OA;
 #[OA\Info(
     version: '1.0.0',
     title: 'SIA Chatbot API',
-    description: 'Fase 1: JWT (admin) + endpoint publico del chatbot (mock).',
+    description: 'Fase 2: JWT (admin) + endpoint publico del chatbot con KB/RAG minimo.',
 )]
 #[OA\Server(
     url: '/',

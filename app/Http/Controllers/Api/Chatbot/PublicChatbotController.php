@@ -14,7 +14,7 @@ class PublicChatbotController extends Controller
     #[OA\Post(
         path: '/api/public/chatbot/chat',
         tags: ['Chatbot'],
-        summary: 'Public chatbot chat (mock)',
+        summary: 'Public chatbot chat (KB + RAG minimo)',
         requestBody: new OA\RequestBody(
             required: true,
             content: new OA\JsonContent(
@@ -34,16 +34,16 @@ class PublicChatbotController extends Controller
                     properties: [
                         new OA\Property(property: 'conversation_id', type: 'string', format: 'uuid'),
                         new OA\Property(property: 'message_id', type: 'string', format: 'uuid'),
-                        new OA\Property(property: 'answer', type: 'string'),
+                        new OA\Property(property: 'answer', type: 'string', example: 'Segun la documentacion cargada: 1) ...'),
                         new OA\Property(
                             property: 'sources',
                             type: 'array',
                             items: new OA\Items(
                                 required: ['title', 'type', 'reference', 'url'],
                                 properties: [
-                                    new OA\Property(property: 'title', type: 'string'),
-                                    new OA\Property(property: 'type', type: 'string', enum: ['pdf', 'api']),
-                                    new OA\Property(property: 'reference', type: 'string'),
+                                    new OA\Property(property: 'title', type: 'string', example: 'Manual de Tramites Regionales'),
+                                    new OA\Property(property: 'type', type: 'string', enum: ['pdf', 'html', 'txt']),
+                                    new OA\Property(property: 'reference', type: 'string', example: 'page:3'),
                                     new OA\Property(property: 'url', type: 'string', nullable: true),
                                 ],
                             ),
