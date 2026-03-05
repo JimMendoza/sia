@@ -22,6 +22,7 @@ class KbChunk extends Model
     protected $fillable = [
         'id',
         'document_id',
+        'node_id',
         'chunk_index',
         'content',
         'page',
@@ -42,5 +43,10 @@ class KbChunk extends Model
     public function document(): BelongsTo
     {
         return $this->belongsTo(KbDocument::class, 'document_id');
+    }
+
+    public function node(): BelongsTo
+    {
+        return $this->belongsTo(KbNode::class, 'node_id');
     }
 }

@@ -4,13 +4,16 @@ namespace App\Services\Chatbot;
 
 use App\Models\Chatbot\ChatConversation;
 use App\Models\Chatbot\ChatMessage;
-use App\Models\Chatbot\KbChunk;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use Throwable;
 
 class SendMessageService
 {
+    private const FALLBACK_NO_SUPPORT = 'No encuentro sustento en la base cargada para responder eso.';
+
+    private const FALLBACK_SERVICE_UNAVAILABLE = 'El servicio de informacion no esta disponible. Intente nuevamente mas tarde.';
+    private const MAX_DISAMBIGUATION_ROUNDS = 2;
+
     public function __construct(private readonly AiClient $aiClient)
     {
     }
@@ -33,6 +36,9 @@ class SendMessageService
             ['channel' => ChatConversation::CHANNEL_WEB],
         );
 
+        $conversationMetadata = (array) ($conversation->metadata ?? []);
+        $updatedMetadata = $conversationMetadata;
+
         ChatMessage::query()->create([
             'id' => (string) Str::uuid(),
             'conversation_id' => $conversation->id,
@@ -42,21 +48,42 @@ class SendMessageService
         ]);
 
         try {
-            $retrievedChunks = $this->aiClient->retrieve(
-                query: $message,
-                topK: (int) config('ai.retrieve_top_k', 5),
+            $state = (array) ($conversationMetadata['disambiguation'] ?? []);
+            $pendingChoices = array_values(
+                array_filter((array) ($state['choices'] ?? []), fn ($choice): bool => is_array($choice))
             );
+            $round = (int) ($state['round'] ?? 0);
+            $topK = (int) config('ai.retrieve_top_k', 5);
 
-            $resolvedChunks = $this->resolveChunksFromKb($retrievedChunks);
-            $chunksForAnswer = $resolvedChunks->take(2)->values();
-
-            $answer = $this->buildAnswer($chunksForAnswer);
-            $sources = $this->buildSources($chunksForAnswer);
+            if ($pendingChoices !== []) {
+                [$answer, $sources, $updatedMetadata] = $this->handlePendingDisambiguation(
+                    message: $message,
+                    conversationId: $conversation->id,
+                    pendingChoices: $pendingChoices,
+                    state: $state,
+                    metadata: $conversationMetadata,
+                    topK: $topK,
+                    round: $round,
+                );
+            } else {
+                [$answer, $sources, $updatedMetadata] = $this->handleFreshQuestion(
+                    message: $message,
+                    conversationId: $conversation->id,
+                    metadata: $conversationMetadata,
+                    topK: $topK,
+                );
+            }
         } catch (Throwable $exception) {
             report($exception);
 
-            $answer = 'El servicio de informacion no esta disponible. Intente nuevamente mas tarde.';
+            $answer = self::FALLBACK_SERVICE_UNAVAILABLE;
             $sources = [];
+            $updatedMetadata = $conversationMetadata;
+        }
+
+        if ($updatedMetadata !== $conversationMetadata) {
+            $conversation->metadata = $updatedMetadata;
+            $conversation->save();
         }
 
         $assistantMessageId = (string) Str::uuid();
@@ -82,77 +109,177 @@ class SendMessageService
     }
 
     /**
-     * @param  array<int, array{document_id: string, chunk_index: ?int, content: string, reference: ?string, page: ?int}>  $retrievedChunks
-     * @return Collection<int, KbChunk>
+     * @param array<string, mixed> $state
+     * @param array<string, mixed> $metadata
+     * @param array<int, array<string, mixed>> $pendingChoices
+     * @return array{0: string, 1: array<int, array{title: string, type: string, reference: string, url: ?string}>, 2: array<string, mixed>}
      */
-    private function resolveChunksFromKb(array $retrievedChunks): Collection
-    {
-        $chunks = collect();
+    private function handlePendingDisambiguation(
+        string $message,
+        string $conversationId,
+        array $pendingChoices,
+        array $state,
+        array $metadata,
+        int $topK,
+        int $round,
+    ): array {
+        $selection = $this->extractNumericSelection($message);
 
-        foreach ($retrievedChunks as $retrievedChunk) {
-            $chunkIndex = $retrievedChunk['chunk_index'];
+        if ($selection !== null && isset($pendingChoices[$selection - 1])) {
+            $choice = $pendingChoices[$selection - 1];
+            $queryText = (string) ($state['query'] ?? $message);
+            $selectedNodeId = (string) ($choice['node_id'] ?? '');
+            $documentId = isset($choice['document_id']) ? (string) $choice['document_id'] : null;
 
-            if (! is_int($chunkIndex)) {
-                continue;
+            if ($selectedNodeId === '') {
+                return [self::FALLBACK_NO_SUPPORT, [], $this->clearDisambiguation($metadata)];
             }
 
-            $chunk = KbChunk::query()
-                ->with('document')
-                ->where('document_id', $retrievedChunk['document_id'])
-                ->where('chunk_index', $chunkIndex)
-                ->first();
+            $chatResult = $this->aiClient->chat(
+                message: $queryText,
+                topK: $topK,
+                selectedNodeId: $selectedNodeId,
+                documentId: $documentId,
+                conversationId: $conversationId,
+            );
 
-            if ($chunk !== null) {
-                $chunks->push($chunk);
+            $answer = (string) ($chatResult['answer'] ?? '');
+            $sources = array_values((array) ($chatResult['sources'] ?? []));
+
+            if ($answer === '') {
+                $answer = self::FALLBACK_NO_SUPPORT;
             }
+
+            if ($answer === self::FALLBACK_NO_SUPPORT) {
+                $sources = [];
+            }
+
+            return [$answer, $sources, $this->clearDisambiguation($metadata)];
         }
 
-        return $chunks
-            ->unique(fn (KbChunk $chunk): string => $chunk->document_id.':'.$chunk->chunk_index)
-            ->values();
+        if ($round >= self::MAX_DISAMBIGUATION_ROUNDS) {
+            return [self::FALLBACK_NO_SUPPORT, [], $this->clearDisambiguation($metadata)];
+        }
+
+        $metadata['disambiguation'] = [
+            'round' => $round + 1,
+            'query' => (string) ($state['query'] ?? ''),
+            'choices' => $pendingChoices,
+        ];
+
+        return [
+            $this->buildDisambiguationAnswer($pendingChoices),
+            [],
+            $metadata,
+        ];
     }
 
     /**
-     * @param  Collection<int, KbChunk>  $chunks
+     * @param array<string, mixed> $metadata
+     * @return array{0: string, 1: array<int, array{title: string, type: string, reference: string, url: ?string}>, 2: array<string, mixed>}
      */
-    private function buildAnswer(Collection $chunks): string
-    {
-        if ($chunks->isEmpty()) {
-            return 'Segun la documentacion cargada, no se encontraron coincidencias para esta consulta.';
+    private function handleFreshQuestion(
+        string $message,
+        string $conversationId,
+        array $metadata,
+        int $topK,
+    ): array {
+        $resolved = $this->aiClient->resolveNodes(query: $message, limit: 5);
+        $candidates = array_values((array) ($resolved['candidates'] ?? []));
+        $strongMatch = (bool) ($resolved['strong_match'] ?? false);
+        $selectedNodeId = null;
+
+        if (isset($resolved['selected_node_id']) && $resolved['selected_node_id'] !== null) {
+            $selectedNodeId = (string) $resolved['selected_node_id'];
         }
 
-        $extracts = $chunks
-            ->map(function (KbChunk $chunk, int $index): string {
-                $excerpt = (string) Str::of($chunk->content)->squish()->limit(180, '...');
+        if ($candidates === []) {
+            return [self::FALLBACK_NO_SUPPORT, [], $this->clearDisambiguation($metadata)];
+        }
 
-                return ($index + 1).') '.$excerpt;
-            })
-            ->implode(' ');
+        if ((! $strongMatch || $selectedNodeId === null || $selectedNodeId === '') && count($candidates) === 1) {
+            $selectedNodeId = isset($candidates[0]['node_id']) ? (string) $candidates[0]['node_id'] : null;
+        }
 
-        return 'Segun la documentacion cargada: '.$extracts;
+        if ($selectedNodeId === null || $selectedNodeId === '') {
+            $metadata['disambiguation'] = [
+                'round' => 1,
+                'query' => $message,
+                'choices' => array_slice($candidates, 0, 5),
+            ];
+
+            return [
+                $this->buildDisambiguationAnswer((array) $metadata['disambiguation']['choices']),
+                [],
+                $metadata,
+            ];
+        }
+
+        $selected = collect($candidates)
+            ->first(fn (array $candidate): bool => ($candidate['node_id'] ?? null) === $selectedNodeId);
+        $documentId = is_array($selected) && isset($selected['document_id'])
+            ? (string) $selected['document_id']
+            : null;
+
+        $chatResult = $this->aiClient->chat(
+            message: $message,
+            topK: $topK,
+            selectedNodeId: $selectedNodeId,
+            documentId: $documentId,
+            conversationId: $conversationId,
+        );
+
+        $answer = (string) ($chatResult['answer'] ?? '');
+        $sources = array_values((array) ($chatResult['sources'] ?? []));
+
+        if ($answer === '') {
+            $answer = self::FALLBACK_NO_SUPPORT;
+        }
+
+        if ($answer === self::FALLBACK_NO_SUPPORT) {
+            $sources = [];
+        }
+
+        return [$answer, $sources, $this->clearDisambiguation($metadata)];
     }
 
     /**
-     * @param  Collection<int, KbChunk>  $chunks
-     * @return array<int, array{title: string, type: string, reference: string, url: ?string}>
+     * @param array<int, array<string, mixed>> $choices
      */
-    private function buildSources(Collection $chunks): array
+    private function buildDisambiguationAnswer(array $choices): string
     {
-        return $chunks
-            ->map(function (KbChunk $chunk): array {
-                $document = $chunk->document;
-                $reference = $chunk->page !== null
-                    ? 'page:'.$chunk->page
-                    : 'chunk:'.$chunk->chunk_index;
+        $lines = ['Necesito que elijas el tramite o tema exacto. Responde solo con el numero:'];
 
-                return [
-                    'title' => $document?->title ?? 'Documento sin titulo',
-                    'type' => $document?->type ?? 'txt',
-                    'reference' => $reference,
-                    'url' => $document?->source_url,
-                ];
-            })
-            ->values()
-            ->all();
+        foreach (array_values($choices) as $index => $choice) {
+            $title = trim((string) ($choice['title'] ?? 'Sin titulo'));
+            $code = isset($choice['code']) && $choice['code'] !== null
+                ? trim((string) $choice['code'])
+                : '';
+            $suffix = $code !== '' ? " ({$code})" : '';
+            $lines[] = ($index + 1).". {$title}{$suffix}";
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function extractNumericSelection(string $message): ?int
+    {
+        $trimmed = trim($message);
+        if ($trimmed === '' || ! ctype_digit($trimmed)) {
+            return null;
+        }
+
+        return (int) $trimmed;
+    }
+
+    /**
+     * @param array<string, mixed> $metadata
+     * @return array<string, mixed>
+     */
+    private function clearDisambiguation(array $metadata): array
+    {
+        unset($metadata['disambiguation']);
+
+        return $metadata;
     }
 }

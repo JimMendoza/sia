@@ -187,6 +187,15 @@ class AiClient
                 'embed' => $embed,
             ]);
 
+        if ($response->failed()) {
+            logger()->error('AiClient ingestExcel upstream error', [
+                'endpoint' => $endpoint,
+                'status' => $response->status(),
+                'path' => $path,
+                'response_body' => $response->body(),
+            ]);
+        }
+
         $response->throw();
 
         $payload = $response->json();

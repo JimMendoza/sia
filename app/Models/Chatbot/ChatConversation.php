@@ -22,6 +22,14 @@ class ChatConversation extends Model
     protected $fillable = [
         'id',
         'channel',
+        'metadata',
+    ];
+
+    /**
+     * @var array<string, string>
+     */
+    protected $casts = [
+        'metadata' => 'array',
     ];
 
     public function messages(): HasMany

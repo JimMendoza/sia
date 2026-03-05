@@ -8,3 +8,6 @@
 .env
 /.vscode
 storage/api-docs/
+ai-service/.venv/
+ai-service/__pycache__/
+ai-service/.pytest_cache/

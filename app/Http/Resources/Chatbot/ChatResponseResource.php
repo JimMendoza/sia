@@ -26,7 +26,7 @@ class ChatResponseResource extends JsonResource
             'conversation_id' => $this->resource['conversation_id'],
             'message_id' => $this->resource['message_id'],
             'answer' => $this->resource['answer'],
-            'sources' => $this->resource['sources'],
+            'sources' => array_values((array) ($this->resource['sources'] ?? [])),
             'policy' => $this->resource['policy'],
         ];
     }
